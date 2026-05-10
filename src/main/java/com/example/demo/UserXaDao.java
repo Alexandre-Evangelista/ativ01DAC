@@ -1,76 +1,132 @@
 package com.example.demo;
 
 import org.h2.jdbcx.JdbcDataSource;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Repository;
 
 import javax.sql.XAConnection;
-import javax.sql.XADataSource;
-import java.sql.*;
+import javax.transaction.xa.XAException;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 
-/**
- * DAO que usa XADataSource para participar do protocolo 2PC.
- *
- * Diferença em relação ao UserJdbcDao:
- * - Não gerencia transação diretamente (sem setAutoCommit / commit / rollback)
- * - Obtém XAConnection e enlista no XATransactionCoordinator (o TM)
- * - O TM decide quando commitar ou desfazer via XAResource
- *
- * O XADataSource é criado internamente (não é um Spring bean) para não
- * conflitar com o DataSource gerenciado pelo Spring Boot. Ambos apontam
- * para o mesmo banco H2 in-memory (spring.datasource.url).
- *
- * Isso demonstra o ponto central do XA:
- *   a conexão executa o SQL, mas quem decide o destino da transação é o TM.
- */
 @Repository
 public class UserXaDao {
 
-    private final XADataSource xaDataSource;
-    private final XATransactionCoordinator coordinator;
+    private final XATransactionCoordinator txCoordinator;
+    private final UserMongoDao mongoDao;
 
     public UserXaDao(
-            @Value("${spring.datasource.url}") String url,
-            @Value("${spring.datasource.username}") String user,
-            @Value("${spring.datasource.password}") String password,
-            XATransactionCoordinator coordinator) {
+            XATransactionCoordinator txCoordinator,
+            UserMongoDao mongoDao
+    ) {
 
-        JdbcDataSource ds = new JdbcDataSource();
-        ds.setURL(url + ";DB_CLOSE_DELAY=-1");
-        ds.setUser(user);
-        ds.setPassword(password);
-        this.xaDataSource = ds;
-        this.coordinator  = coordinator;
+        this.txCoordinator = txCoordinator;
+        this.mongoDao = mongoDao;
     }
 
-    /**
-     * Insere um usuário dentro da transação XA corrente.
-     *
-     * O XAConnection é aberto, enlistado no coordenador e mantido aberto
-     * até o TM chamar commit() ou rollback(). O inner Connection é fechado
-     * após o SQL, mas o XAResource permanece ativo.
-     */
-    public void save(UserEntity user) throws Exception {
-        XAConnection xaConn = xaDataSource.getXAConnection();
-        coordinator.enlist(xaConn);
+    public void save(UserEntity user) {
 
-        try (Connection conn = xaConn.getConnection();
-             PreparedStatement ps = conn.prepareStatement(
-                     "INSERT INTO users (name, email) VALUES (?, ?)",
-                     Statement.RETURN_GENERATED_KEYS)) {
+        XAConnection h2XaConn = null;
+
+        try {
+
+            // ─────────────────────────────
+            // BEGIN
+            // ─────────────────────────────
+
+            txCoordinator.begin();
+
+            // ─────────────────────────────
+            // H2 XA RESOURCE
+            // ─────────────────────────────
+
+            JdbcDataSource ds = new JdbcDataSource();
+
+            ds.setURL("jdbc:h2:mem:testdb");
+            ds.setUser("sa");
+            ds.setPassword("password");
+
+            h2XaConn = ds.getXAConnection();
+
+            txCoordinator.enlist(h2XaConn);
+
+            Connection conn = h2XaConn.getConnection();
+
+            PreparedStatement ps =
+                    conn.prepareStatement(
+                            "INSERT INTO user_entity(name) VALUES(?)"
+                    );
 
             ps.setString(1, user.getName());
-            ps.setString(2, user.getEmail());
+
             ps.executeUpdate();
 
-            try (ResultSet keys = ps.getGeneratedKeys()) {
-                if (keys.next()) {
-                    user.setId(keys.getLong(1));
-                }
-            }
-        }
+            System.out.println("[APP] Usuário salvo no H2");
 
-        System.out.println("[XA-DAO] INSERT executado para '" + user.getName()
-                + "' — aguardando decisão do TM...");
+            // ─────────────────────────────
+            // SIMULA FALHA
+            // ─────────────────────────────
+
+            if(user.getName().equals("erro")) {
+
+                throw new RuntimeException(
+                        "Falha simulada Mongo"
+                );
+            }
+
+            // ─────────────────────────────
+            // MONGO
+            // ─────────────────────────────
+
+            mongoDao.save(user);
+
+            System.out.println("[APP] Usuário salvo no Mongo");
+
+            // ─────────────────────────────
+            // END
+            // ─────────────────────────────
+
+            txCoordinator.delistAll();
+
+            // ─────────────────────────────
+            // PREPARE
+            // ─────────────────────────────
+
+            boolean ok = txCoordinator.prepare();
+
+            // ─────────────────────────────
+            // COMMIT / ROLLBACK
+            // ─────────────────────────────
+
+            if(ok) {
+
+                txCoordinator.commit();
+
+            } else {
+
+                txCoordinator.rollback();
+            }
+
+        } catch (Exception ex) {
+
+            ex.printStackTrace();
+
+            try {
+
+                txCoordinator.rollback();
+
+            } catch (Exception e) {
+
+                e.printStackTrace();
+            }
+
+            // SAGA COMPENSATÓRIA
+            try {
+
+                mongoDao.delete(user.getId());
+
+            } catch(Exception ignored){}
+
+            throw new RuntimeException(ex);
+        }
     }
 }

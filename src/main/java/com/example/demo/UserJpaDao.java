@@ -22,9 +22,7 @@ import java.util.List;
  * @version 1.0
  */
 @Repository
-@Primary
 @Qualifier("jpa")
-@ConditionalOnProperty(name = "app.dao.impl", havingValue = "jpa", matchIfMissing = true)
 public class UserJpaDao implements UserDao {
 
     /** EntityManager injetado para gerenciar operações de persistência */

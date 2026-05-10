@@ -37,9 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * Em produção, use ObjectId ou um gerador distribuído (Snowflake, ULID).
  */
 @Repository
-@Primary
 @Qualifier("mongo")
-@ConditionalOnProperty(name = "app.dao.impl", havingValue = "mongo")
 public class UserMongoDao implements UserDao {
 
     private final MongoCollection<Document> collection;
