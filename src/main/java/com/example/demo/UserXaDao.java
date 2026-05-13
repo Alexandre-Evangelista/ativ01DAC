@@ -53,10 +53,11 @@ public class UserXaDao {
 
             PreparedStatement ps =
                     conn.prepareStatement(
-                            "INSERT INTO user_entity(name) VALUES(?)"
+                            "INSERT INTO users(name, email) VALUES(?, ?)"
                     );
 
             ps.setString(1, user.getName());
+            ps.setString(2, user.getEmail());
 
             ps.executeUpdate();
 
